@@ -1,7 +1,7 @@
 package DesignPattern.SingletonDesignPattern;
 
 public class SingletonClas {
- private static  SingletonClas obj;
+ private static volatile SingletonClas obj;
  private SingletonClas() {
 	 System.out.println("private constructor called 	");
  }
@@ -17,7 +17,7 @@ public class SingletonClas {
 			 obj=new SingletonClas();			
 		}
 	 }
-	 //can we remove the if at line 9 why?
+	 //line no 9 is necessary so that multiple threads need not to wait outside the sync block after object initialisation .
 	 
 	 return obj;
  }
