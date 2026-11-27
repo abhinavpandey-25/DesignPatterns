@@ -1,0 +1,262 @@
+import java.util.*;
+import java.util.concurrent.atomic.AtomicInteger;
+
+enum OrderStatus {
+    PLACED, ACCEPTED, PREPARING, OUT_FOR_DELIVERY, DELIVERED, CANCELLED;
+
+    // allowed transitions, so an order can't jump from DELIVERED back to PLACED
+    boolean canMoveTo(OrderStatus next) {
+        switch (this) {
+            case PLACED:           return next == ACCEPTED || next == CANCELLED;
+            case ACCEPTED:         return next == PREPARING || next == CANCELLED;
+            case PREPARING:        return next == OUT_FOR_DELIVERY;
+            case OUT_FOR_DELIVERY: return next == DELIVERED;
+            default:               return false;   // DELIVERED and CANCELLED are final
+        }
+    }
+}
+
+class MenuItem {
+    private final String itemId, name;
+    private final double price;
+
+    MenuItem(String itemId, String name, double price) {
+        this.itemId = itemId; this.name = name; this.price = price;
+    }
+    String getName()  { return name; }
+    double getPrice() { return price; }
+}
+
+class Restaurant {
+    private final String restaurantId, name;
+    private final List<MenuItem> menu = new ArrayList<>();
+
+    Restaurant(String restaurantId, String name) {
+        this.restaurantId = restaurantId; this.name = name;
+    }
+    void addItem(MenuItem item)     { menu.add(item); }
+    boolean hasItem(MenuItem item)  { return menu.contains(item); }
+    String getName()                { return name; }
+}
+
+// one line of an order: item + quantity + the price at the time of ordering
+class OrderItem {
+    private final MenuItem item;
+    private final int quantity;
+    private final double unitPrice;
+
+    OrderItem(MenuItem item, int quantity) {
+        if (quantity <= 0) throw new IllegalArgumentException("Quantity must be positive");
+        this.item = item;
+        this.quantity = quantity;
+        this.unitPrice = item.getPrice();      // price snapshot: later menu changes don't affect this order
+    }
+    MenuItem getItem() { return item; }
+    double total()     { return unitPrice * quantity; }
+}
+
+class DeliveryAgent {
+    private final String agentId;
+    private boolean available = true;
+
+    DeliveryAgent(String agentId) { this.agentId = agentId; }
+
+    synchronized boolean isAvailable() { return available; }
+    synchronized void reserve() {
+        if (!available) throw new IllegalStateException(agentId + " is already busy");
+        available = false;
+    }
+    synchronized void release() { available = true; }
+    String getAgentId() { return agentId; }
+}
+
+// Strategy: how to pick an agent (the order is passed so a "nearest agent" strategy is possible)
+interface AssignmentStrategy {
+    Optional<DeliveryAgent> assign(Order order, List<DeliveryAgent> agents);
+}
+
+class FirstAvailableAssignmentStrategy implements AssignmentStrategy {
+    @Override
+    public Optional<DeliveryAgent> assign(Order order, List<DeliveryAgent> agents) {
+        return agents.stream().filter(DeliveryAgent::isAvailable).findFirst();
+    }
+}
+
+// Observer: who gets told when an order's status changes
+interface OrderObserver {
+    void onStatusChanged(Order order);
+}
+
+class ConsoleNotifier implements OrderObserver {
+    @Override
+    public void onStatusChanged(Order order) {
+        System.out.println("[notify] " + order.getOrderId() + " is now " + order.getStatus());
+    }
+}
+
+class Order {
+    private final String orderId;
+    private final Restaurant restaurant;
+    private final List<OrderItem> items;
+    private OrderStatus status = OrderStatus.PLACED;
+    private DeliveryAgent assignedAgent;
+
+    Order(String orderId, Restaurant restaurant, List<OrderItem> items) {
+        this.orderId = orderId; this.restaurant = restaurant; this.items = items;
+    }
+
+    double totalAmount() {
+        return items.stream().mapToDouble(OrderItem::total).sum();
+    }
+    boolean canCancel() { return status.canMoveTo(OrderStatus.CANCELLED); }
+
+    void moveTo(OrderStatus next) {
+        if (!status.canMoveTo(next))
+            throw new IllegalStateException("Order " + orderId + " cannot go from " + status + " to " + next);
+        status = next;
+    }
+
+    String getOrderId()              { return orderId; }
+    OrderStatus getStatus()          { return status; }
+    DeliveryAgent getAssignedAgent() { return assignedAgent; }
+    void setAssignedAgent(DeliveryAgent a) { this.assignedAgent = a; }
+}
+
+class OrderService {
+    private final AssignmentStrategy strategy;
+    private final List<DeliveryAgent> agents;
+    private final List<OrderObserver> observers = new ArrayList<>();
+    private final Map<String, Order> orders = new HashMap<>();
+    private final Deque<Order> waitingForAgent = new ArrayDeque<>();
+    private final AtomicInteger seq = new AtomicInteger(1);
+
+    OrderService(AssignmentStrategy strategy, List<DeliveryAgent> agents) {
+        this.strategy = strategy;
+        this.agents = agents;
+    }
+
+    void addObserver(OrderObserver o) { observers.add(o); }
+
+    // all public methods are synchronized so two threads can't grab the same agent
+    synchronized Order placeOrder(Restaurant restaurant, List<OrderItem> items) {
+        if (restaurant == null || items == null || items.isEmpty())
+            throw new IllegalArgumentException("Restaurant and at least one item are required");
+        for (OrderItem i : items)
+            if (!restaurant.hasItem(i.getItem()))
+                throw new IllegalArgumentException(i.getItem().getName() + " is not on " + restaurant.getName() + "'s menu");
+
+        Order order = new Order("ORD-" + seq.getAndIncrement(), restaurant, items);
+        orders.put(order.getOrderId(), order);
+        notifyObservers(order);
+        return order;
+    }
+
+    synchronized void acceptOrder(String orderId) {
+        Order order = find(orderId);
+        changeStatus(order, OrderStatus.ACCEPTED);
+        tryAssign(order);
+    }
+
+    synchronized void startPreparing(String orderId) {
+        changeStatus(find(orderId), OrderStatus.PREPARING);
+    }
+
+    synchronized void pickUp(String orderId) {
+        Order order = find(orderId);
+        if (order.getAssignedAgent() == null)
+            throw new IllegalStateException("No delivery agent assigned to " + orderId + " yet");
+        changeStatus(order, OrderStatus.OUT_FOR_DELIVERY);
+    }
+
+    synchronized void deliver(String orderId) {
+        Order order = find(orderId);
+        changeStatus(order, OrderStatus.DELIVERED);
+        releaseAgent(order.getAssignedAgent());
+    }
+
+    synchronized boolean cancelOrder(String orderId) {
+        Order order = find(orderId);
+        if (!order.canCancel()) return false;
+        changeStatus(order, OrderStatus.CANCELLED);
+        waitingForAgent.remove(order);
+        DeliveryAgent agent = order.getAssignedAgent();
+        if (agent != null) {
+            order.setAssignedAgent(null);
+            releaseAgent(agent);
+        }
+        return true;
+    }
+
+    private void tryAssign(Order order) {
+        Optional<DeliveryAgent> agent = strategy.assign(order, agents);
+        if (agent.isPresent()) {
+            agent.get().reserve();
+            order.setAssignedAgent(agent.get());
+            System.out.println("[assign] " + agent.get().getAgentId() + " -> " + order.getOrderId());
+        } else {
+            waitingForAgent.add(order);
+            System.out.println("[assign] no agent free, " + order.getOrderId() + " is waiting");
+        }
+    }
+
+    // when an agent frees up, give them to the longest-waiting order
+    private void releaseAgent(DeliveryAgent agent) {
+        agent.release();
+        Order next = waitingForAgent.poll();
+        if (next != null) tryAssign(next);
+    }
+
+    private void changeStatus(Order order, OrderStatus next) {
+        order.moveTo(next);
+        notifyObservers(order);
+    }
+
+    private void notifyObservers(Order order) {
+        for (OrderObserver o : observers) o.onStatusChanged(order);
+    }
+
+    private Order find(String orderId) {
+        Order order = orders.get(orderId);
+        if (order == null) throw new IllegalArgumentException("Unknown order: " + orderId);
+        return order;
+    }
+}
+
+public class Main {
+    public static void main(String[] args) {
+        Restaurant pizza = new Restaurant("R1", "Pizza Palace");
+        MenuItem margherita = new MenuItem("M1", "Margherita", 250);
+        MenuItem garlicBread = new MenuItem("M2", "Garlic Bread", 120);
+        pizza.addItem(margherita);
+        pizza.addItem(garlicBread);
+
+        OrderService service = new OrderService(
+                new FirstAvailableAssignmentStrategy(),
+                Arrays.asList(new DeliveryAgent("AGENT-1")));      // only ONE agent, to show waiting
+        service.addObserver(new ConsoleNotifier());
+
+        Order o1 = service.placeOrder(pizza,
+                Arrays.asList(new OrderItem(margherita, 2), new OrderItem(garlicBread, 1)));
+        Order o2 = service.placeOrder(pizza, Arrays.asList(new OrderItem(garlicBread, 3)));
+        System.out.println("o1 total = " + o1.totalAmount());      // 620.0
+        System.out.println("o2 total = " + o2.totalAmount());      // 360.0
+
+        System.out.println("\n--- both orders get accepted, but there is only one agent ---");
+        service.acceptOrder(o1.getOrderId());    // gets AGENT-1
+        service.acceptOrder(o2.getOrderId());    // has to wait
+
+        System.out.println("\n--- o1 goes through the full lifecycle ---");
+        service.startPreparing(o1.getOrderId());
+        service.pickUp(o1.getOrderId());
+        service.deliver(o1.getOrderId());        // frees AGENT-1, who is handed to o2
+
+        System.out.println("\n--- invalid actions are rejected ---");
+        try {
+            service.acceptOrder(o1.getOrderId());
+        } catch (IllegalStateException e) {
+            System.out.println("rejected: " + e.getMessage());
+        }
+        System.out.println("can cancel delivered o1? " + service.cancelOrder(o1.getOrderId()));
+        System.out.println("can cancel accepted o2?  " + service.cancelOrder(o2.getOrderId()));
+    }
+}
